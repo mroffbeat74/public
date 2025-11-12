@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# uninstall_patchmon.sh
+# uninstall_patchmon.sh (v1.1)
+# Safe, scoped uninstall for PatchMon agent (Go). Dry-run by default.
+
 set -euo pipefail
 
 DRY_RUN=1
@@ -17,8 +19,8 @@ UNIT_LIB="/lib/systemd/system/patchmon-agent.service"
 CONF_DIR="/etc/patchmon"
 CONF_YML="$CONF_DIR/config.yml"
 CREDS_YML="$CONF_DIR/credentials.yml"
-LEGACY_CREDS="/etc/patchmon/credentials"                   # legacy that script may have removed
-LOG1="/etc/patchmon/logs/patchmon-agent.log"
+LEGACY_CREDS="/etc/patchmon/credentials"  # legacy from bash agent
+LOG1="$CONF_DIR/logs/patchmon-agent.log"
 LOG2="/var/log/patchmon-agent.log"
 
 say "== PatchMon uninstall helper =="
@@ -28,10 +30,8 @@ say ""
 #####################################
 # 1) Detect running service / process
 #####################################
-service_present=0
 if command -v systemctl >/dev/null 2>&1; then
   if systemctl list-unit-files | grep -q '^patchmon-agent\.service'; then
-    service_present=1
     found_any=1
     say "• systemd unit found: patchmon-agent.service"
     if systemctl is-active --quiet patchmon-agent.service; then
@@ -40,11 +40,8 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
     say "  - Will disable + remove the unit if present"
     doit "systemctl disable patchmon-agent.service 2>/dev/null || true"
-    # Remove unit files only if exactly matching known paths
     for unit in "$UNIT_ETC" "$UNIT_LIB"; do
-      if [[ -f "$unit" ]]; then
-        doit "rm -f '$unit'"
-      fi
+      [[ -f "$unit" ]] && doit "rm -f '$unit'"
     done
     doit "systemctl daemon-reload"
   fi
@@ -69,20 +66,14 @@ fi
 #####################################
 # 3) Remove configs (ONLY known files)
 #####################################
-if [[ -f "$CONF_YML" ]] || [[ -f "$CREDS_YML" ]] || [[ -f "$LEGACY_CREDS" ]]; then
+if [[ -f "$CONF_YML" ]] || [[ -f "$CREDS_YML" ]] || [[ -f "$LEGACY_CREDS" ]] || [[ -d "$CONF_DIR" ]]; then
   found_any=1
-  say "• Config/credential files detected -> will remove known files only"
-  for f in "$CONF_YML" "$CREDS_YML" "$LEGACY_CREDS"; do
-    [[ -f "$f" ]] && doit "rm -f '$f'"
-  done
-  # If directory exists and is now empty, remove it; else, leave it untouched.
-  if [[ -d "$CONF_DIR" ]]; then
-    if [[ -z "$(find "$CONF_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null)" ]]; then
-      say "  - '$CONF_DIR' appears empty -> will remove directory"
-      doit "rmdir '$CONF_DIR' || true"
-    else
-      say "  - '$CONF_DIR' not empty -> leaving directory as-is"
-    fi
+  # remove only the known files first; don't touch dir yet
+  if [[ -f "$CONF_YML" ]] || [[ -f "$CREDS_YML" ]] || [[ -f "$LEGACY_CREDS" ]]; then
+    say "• Config/credential files detected -> will remove known files only"
+    for f in "$CONF_YML" "$CREDS_YML" "$LEGACY_CREDS"; do
+      [[ -f "$f" ]] && doit "rm -f '$f'"
+    done
   fi
 fi
 
@@ -94,11 +85,15 @@ for logf in "$LOG1" "$LOG2"; do
     found_any=1
     say "• Log file found: $logf -> will remove"
     doit "rm -f '$logf'"
-    # Try to remove parent logs dir if empty (only the immediate dir)
-    parent="$(dirname "$logf")"
-    if [[ -d "$parent" ]] && [[ -z "$(find "$parent" -mindepth 1 -maxdepth 1 -type f 2>/dev/null)" ]]; then
-      doit "rmdir '$parent' || true"
-    fi
+  fi
+done
+
+# Try to remove the parent logs dir(s) if empty (only the immediate dir)
+for parent in "$(dirname "$LOG1")" "$(dirname "$LOG2")"; do
+  [[ -d "$parent" ]] || continue
+  # Only delete if now empty (files only; leave if other stuff exists)
+  if [[ -z "$(find "$parent" -mindepth 1 -maxdepth 1 -type f 2>/dev/null)" ]]; then
+    doit "rmdir '$parent' || true"
   fi
 done
 
@@ -125,6 +120,21 @@ if [[ -n "$current_cron" ]] && echo "$current_cron" | grep -q "patchmon-agent"; 
 fi
 
 #####################################
+# 6) Final: clean empty subdirs then try /etc/patchmon again
+#####################################
+if [[ -d "$CONF_DIR" ]]; then
+  # Remove any empty subdirectories first
+  doit "find '$CONF_DIR' -type d -empty -delete"
+  # Only remove /etc/patchmon if it is now empty of files and subdirs
+  if [[ -z "$(find "$CONF_DIR" -mindepth 1 -maxdepth 1 2>/dev/null)" ]]; then
+    say "• '$CONF_DIR' appears empty -> will remove directory"
+    doit "rmdir '$CONF_DIR' || true"
+  else
+    say "• '$CONF_DIR' not empty -> leaving directory as-is"
+  fi
+fi
+
+#####################################
 # Summary
 #####################################
 echo
@@ -138,5 +148,6 @@ else
     say "  - systemctl status patchmon-agent (should be not-found/inactive)"
     say "  - command -v patchmon-agent (should not find it)"
     say "  - crontab -l (should not contain patchmon-agent lines)"
+    say "  - test -d /etc/patchmon || echo '/etc/patchmon removed'"
   fi
 fi
